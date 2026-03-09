@@ -1275,6 +1275,20 @@ private struct SettingsSheet: View {
                         }
                         .toggleStyle(.switch)
                         .controlSize(.small)
+
+                        Divider()
+
+                        Toggle(isOn: $chatManager.firstPersonAnswers) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("First-Person Answers")
+                                    .font(.system(size: 12, weight: .medium))
+                                Text("Claude answers as if you're speaking in the meeting")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
                     }
 
                     // MARK: File Editing

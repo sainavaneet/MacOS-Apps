@@ -9,6 +9,7 @@ final class ChatManager: ObservableObject {
     @Published var mcpConnected = false
     @AppStorage("auto_answer_enabled") var autoAnswer = true
     @AppStorage("auto_connect_mcp") var autoConnectMCP = false
+    @AppStorage("first_person_answers") var firstPersonAnswers = false
 
     // File/Command operations
     @Published var fileOperationManager = FileOperationManager()
@@ -309,6 +310,25 @@ final class ChatManager: ObservableObject {
 
             You have access to a research knowledge graph via tools. Use these tools when the user \
             asks about papers, experiments, tasks, people, or research-related topics.
+            """
+        }
+
+        if firstPersonAnswers {
+            prompt += """
+
+            RESPONSE STYLE - FIRST PERSON:
+            Format all your answers as if the user is speaking directly in the meeting.
+            Use "I", "we", "our" instead of "you should" or "the answer is".
+
+            Examples:
+            ❌ "You should consider updating the code"
+            ✅ "I think we should update the code"
+
+            ❌ "The meeting covered several topics"
+            ✅ "We discussed several important topics in the meeting"
+
+            Make responses natural and conversational, as if the user is contributing to the meeting.
+            Keep answers concise and meeting-appropriate (60-200 words typically).
             """
         }
 
