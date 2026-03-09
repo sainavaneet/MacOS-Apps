@@ -214,6 +214,38 @@ private struct ChatView: View {
                                 .id(message.id)
                         }
 
+                        // Pending file operations
+                        ForEach(chatManager.fileOperationManager.pendingOperations) { operation in
+                            FileOperationBubble(
+                                operation: operation,
+                                onApprove: {
+                                    Task {
+                                        await chatManager.fileOperationManager.approveOperation(operation)
+                                    }
+                                },
+                                onReject: {
+                                    chatManager.fileOperationManager.rejectOperation(operation)
+                                }
+                            )
+                            .id("file_\(operation.id)")
+                        }
+
+                        // Pending commands
+                        ForEach(chatManager.commandExecutor.pendingCommands) { command in
+                            CommandOutputBubble(
+                                command: command,
+                                onApprove: {
+                                    Task {
+                                        await chatManager.commandExecutor.approveCommand(command)
+                                    }
+                                },
+                                onReject: {
+                                    chatManager.commandExecutor.rejectCommand(command)
+                                }
+                            )
+                            .id("cmd_\(command.id)")
+                        }
+
                         if chatManager.isLoading {
                             TypingIndicator()
                                 .id("loading")
@@ -319,6 +351,43 @@ private struct ChatView: View {
                 .help(chatManager.mcpConnected ? "MCP Connected" : "Connect MCP")
 
                 Divider()
+
+                // File editing mode toggle
+                if chatManager.fileEditingEnabled {
+                    Menu {
+                        ForEach(OperationMode.allCases, id: \.rawValue) { mode in
+                            Button(action: { chatManager.operationMode = mode.rawValue }) {
+                                HStack {
+                                    Image(systemName: mode.icon)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(mode.displayName)
+                                            .font(.system(size: 11, weight: .semibold))
+                                        Text(mode.description)
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if chatManager.operationMode == mode.rawValue {
+                                        Spacer()
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: currentModeIcon)
+                                .font(.system(size: 11))
+                            Text(currentModeName)
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundStyle(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Operation Mode: \(currentModeName)")
+
+                    Divider()
+                }
 
                 // Selected mic name
                 HStack(spacing: 3) {
@@ -538,6 +607,20 @@ private struct ChatView: View {
 
     private var currentModelName: String {
         ChatManager.availableModels.first(where: { $0.id == chatManager.model })?.name ?? "Haiku 4.5"
+    }
+
+    private var currentModeName: String {
+        if let mode = OperationMode(rawValue: chatManager.operationMode) {
+            return mode.displayName
+        }
+        return "Permissions"
+    }
+
+    private var currentModeIcon: String {
+        if let mode = OperationMode(rawValue: chatManager.operationMode) {
+            return mode.icon
+        }
+        return "checkmark.square"
     }
 
     private var canSend: Bool {
@@ -1192,6 +1275,40 @@ private struct SettingsSheet: View {
                         }
                         .toggleStyle(.switch)
                         .controlSize(.small)
+                    }
+
+                    // MARK: File Editing
+                    settingsSection("File Editing", icon: "filemenu.and.cursorarrow", color: .blue) {
+                        Toggle(isOn: $chatManager.fileEditingEnabled) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Enable File Editing")
+                                    .font(.system(size: 12, weight: .medium))
+                                Text("Allow Claude to read, write, and create files")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+
+                        if chatManager.fileEditingEnabled {
+                            Divider()
+
+                            settingsRow("Operation Mode") {
+                                Picker("", selection: $chatManager.operationMode) {
+                                    Text("Permissions").tag(OperationMode.permissions.rawValue)
+                                    Text("Plan").tag(OperationMode.plan.rawValue)
+                                    Text("Auto-Approve").tag(OperationMode.autoApprove.rawValue)
+                                }
+                                .labelsHidden()
+                            }
+
+                            settingsRow("Project Root") {
+                                TextField("Path", text: $chatManager.projectRootPath)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11, design: .monospaced))
+                            }
+                        }
                     }
 
                     // MARK: Errors

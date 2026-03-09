@@ -10,6 +10,13 @@ final class ChatManager: ObservableObject {
     @AppStorage("auto_answer_enabled") var autoAnswer = true
     @AppStorage("auto_connect_mcp") var autoConnectMCP = false
 
+    // File/Command operations
+    @Published var fileOperationManager = FileOperationManager()
+    @Published var commandExecutor = CommandExecutor()
+    @AppStorage("operation_mode") var operationMode: String = OperationMode.permissions.rawValue
+    @AppStorage("file_editing_enabled") var fileEditingEnabled = true
+    @AppStorage("project_root_path") var projectRootPath: String = "/Users/sainavaneet/PROJECTS/MacOS-Apps"
+
     @AppStorage("anthropic_api_key") var apiKey: String = ""
     @AppStorage("mcp_server_path") var mcpServerPath: String =
         "/Users/sainavaneet/Library/Mobile Documents/com~apple~CloudDocs/WORK/Tensiq/research-graph"
@@ -251,9 +258,38 @@ final class ChatManager: ObservableObject {
 
     private func buildSystemPrompt(transcript: String) -> String {
         var prompt = """
-        You are a helpful meeting assistant. You help answer questions and provide insights \
-        during meetings. Be concise and direct in your responses.
+        You are a helpful assistant. You can help answer questions, provide insights, and \
+        modify code and files. Be concise and direct in your responses.
         """
+
+        if fileEditingEnabled {
+            let modeDesc = switch operationMode {
+            case OperationMode.permissions.rawValue:
+                "You can read, write, create, and delete files. The user will approve each operation."
+            case OperationMode.plan.rawValue:
+                "You can read, write, create, and delete files. Show a plan of all operations first, user approves once."
+            case OperationMode.autoApprove.rawValue:
+                "You can read, write, create, and delete files. Operations are auto-approved immediately."
+            default:
+                "File editing is disabled."
+            }
+
+            prompt += """
+
+            FILE EDITING MODE:
+            \(modeDesc)
+
+            Project root: \(projectRootPath)
+
+            When modifying files:
+            1. Show the file path and type of change
+            2. For edits, show a clear diff or before/after
+            3. For creation, show the full file content
+            4. Explain why the change is needed
+
+            You can also execute shell commands. Dangerous commands require approval.
+            """
+        }
 
         if !transcript.isEmpty {
             prompt += """
