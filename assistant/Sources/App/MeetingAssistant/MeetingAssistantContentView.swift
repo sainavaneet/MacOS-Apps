@@ -719,9 +719,9 @@ private struct ChatView: View {
                 isFocused: $inputFocused,
                 onEnter: { sendMessage() }
             )
-            .frame(minHeight: 34, maxHeight: 160)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
+            .frame(minHeight: 22, maxHeight: 100)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
             .background(
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color(.controlBackgroundColor).opacity(0.5))
@@ -1675,7 +1675,7 @@ private struct MultiLineInput: NSViewRepresentable {
         textView.drawsBackground = false
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
-        textView.textContainerInset = NSSize(width: 0, height: 4)
+        textView.textContainerInset = NSSize(width: 0, height: 2)
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineFragmentPadding = 0
         textView.delegate = context.coordinator
@@ -1755,7 +1755,7 @@ private class InputTextView: NSTextView {
         }
         manager.ensureLayout(for: container)
         let rect = manager.usedRect(for: container)
-        let height = min(max(rect.height + textContainerInset.height * 2, 26), 150)
+        let height = min(max(rect.height + textContainerInset.height * 2, 18), 100)
         return NSSize(width: NSView.noIntrinsicMetric, height: height)
     }
 }

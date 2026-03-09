@@ -26,6 +26,12 @@ final class SpeechEngine: ObservableObject {
     private var smoothedLevel: Float = 0
     private var pauseTimer: Timer?
 
+    // Noise gate: ignore buffers below this RMS level
+    private let noiseGateThreshold: Float = 0.008
+    // Track consecutive silent buffers to avoid sending noise
+    private var silentBufferCount: Int = 0
+    private let maxSilentBuffers: Int = 20 // ~0.9s of silence before we stop feeding
+
     func toggleListening(microphoneID: String) {
         if isListening {
             stopListening()
@@ -39,7 +45,7 @@ final class SpeechEngine: ObservableObject {
         guard isListening else { return }
         stopListening()
         Task {
-            try? await Task.sleep(for: .milliseconds(100))
+            try? await Task.sleep(for: .milliseconds(200))
             startListening(microphoneID: microphoneID)
         }
     }
@@ -50,6 +56,7 @@ final class SpeechEngine: ObservableObject {
         partialTranscript = ""
         currentMicrophoneID = microphoneID
         shouldStayListening = true
+        silentBufferCount = 0
 
         print("[SpeechEngine] Starting — requesting microphone permission...")
 
@@ -116,11 +123,12 @@ final class SpeechEngine: ObservableObject {
 
         print("[SpeechEngine] Recognizer available. Supports on-device: \(speechRecognizer.supportsOnDeviceRecognition)")
 
-        // 2. Create recognition request
+        // 2. Create recognition request with quality settings
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+        request.addsPunctuation = true
 
-        // Prefer on-device recognition if available (avoids network issues)
+        // Prefer on-device recognition if available (lower latency, no network needed)
         if speechRecognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
             print("[SpeechEngine] Using on-device recognition")
@@ -163,21 +171,33 @@ final class SpeechEngine: ObservableObject {
             return
         }
 
-        // 5. Install tap BEFORE prepare/start
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+        // 5. Install tap with larger buffer for smoother audio delivery
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            self.recognitionRequest?.append(buffer)
 
             // Compute RMS audio level
             let level = self.computeRMS(buffer: buffer)
+
+            // Noise gate: only send audio above threshold to recognizer
+            if level > self.noiseGateThreshold {
+                self.recognitionRequest?.append(buffer)
+                self.silentBufferCount = 0
+            } else {
+                self.silentBufferCount += 1
+                // Still send occasional silent buffers so recognizer stays alive
+                if self.silentBufferCount % 10 == 0 {
+                    self.recognitionRequest?.append(buffer)
+                }
+            }
 
             Task { @MainActor in
                 if !self.isReceivingAudio {
                     self.isReceivingAudio = true
                     print("[SpeechEngine] Audio buffers flowing")
                 }
-                // Exponential smoothing for visual display
-                self.smoothedLevel = 0.3 * level + 0.7 * self.smoothedLevel
+                // Smooth audio level for visual display
+                let alpha: Float = level > self.smoothedLevel ? 0.4 : 0.15
+                self.smoothedLevel = alpha * level + (1 - alpha) * self.smoothedLevel
                 self.audioLevel = self.smoothedLevel
             }
         }
@@ -216,10 +236,14 @@ final class SpeechEngine: ObservableObject {
                 }
                 partialTranscript = ""
             } else {
-                partialTranscript = result.bestTranscription.formattedString
-                // Pause detection: if partial text stays stable for 1.5s,
-                // restart recognition to finalize the utterance.
-                resetPauseTimer()
+                let partial = result.bestTranscription.formattedString
+                // Only update partial if it has meaningful content
+                if !partial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    partialTranscript = partial
+                    // Pause detection: if partial text stays stable for 2s,
+                    // restart recognition to finalize the utterance.
+                    resetPauseTimer()
+                }
             }
         }
 
@@ -231,19 +255,23 @@ final class SpeechEngine: ObservableObject {
             // 209 = recognition task was cancelled (normal during restart)
             // 301 = recognition request was cancelled (normal during restart)
             // 1110 = no speech detected (expected when silent)
-            let ignoredCodes: Set<Int> = [216, 209, 301, 1110]
+            // 203 = retry (transient network issue)
+            let ignoredCodes: Set<Int> = [216, 209, 301, 1110, 203]
             if !ignoredCodes.contains(nsError.code) {
                 print("[SpeechEngine] Recognition error [\(nsError.code)]: \(error.localizedDescription)")
-                errorMessage = error.localizedDescription
+                // Only show persistent errors, not transient ones
+                if nsError.code != 4 { // 4 = operation couldn't be completed
+                    errorMessage = error.localizedDescription
+                }
             } else {
-                print("[SpeechEngine] Ignored recognition event [\(nsError.code)]: \(error.localizedDescription)")
+                print("[SpeechEngine] Ignored recognition event [\(nsError.code)]")
             }
         }
     }
 
     private func resetPauseTimer() {
         pauseTimer?.invalidate()
-        pauseTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 guard self.shouldStayListening, self.isListening,
@@ -256,7 +284,7 @@ final class SpeechEngine: ObservableObject {
 
     private func startRestartTimer() {
         restartTimer?.invalidate()
-        restartTimer = Timer.scheduledTimer(withTimeInterval: 50.0, repeats: false) { [weak self] _ in
+        restartTimer = Timer.scheduledTimer(withTimeInterval: 55.0, repeats: false) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 self.restartRecognition()
@@ -280,13 +308,20 @@ final class SpeechEngine: ObservableObject {
         }
         partialTranscript = ""
         isReceivingAudio = false
+        silentBufferCount = 0
 
         // Now tear down and restart
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
         stopAudioEngine()
-        setupAudioAndRecognition(microphoneID: currentMicID)
+
+        // Small delay before restarting to let the system clean up
+        Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard self.shouldStayListening else { return }
+            self.setupAudioAndRecognition(microphoneID: currentMicID)
+        }
     }
 
     func loadTranscript(_ text: String) {
@@ -309,6 +344,7 @@ final class SpeechEngine: ObservableObject {
         isReceivingAudio = false
         audioLevel = 0
         smoothedLevel = 0
+        silentBufferCount = 0
         stopElapsedTimer()
     }
 
@@ -353,7 +389,7 @@ final class SpeechEngine: ObservableObject {
         recordingStartDate = Date()
         elapsedTime = 0
         elapsedTimer?.invalidate()
-        elapsedTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        elapsedTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 if let start = self.recordingStartDate {
