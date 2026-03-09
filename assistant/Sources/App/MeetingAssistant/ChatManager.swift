@@ -33,7 +33,10 @@ final class ChatManager: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        messages.append(ChatMessage(role: .user, content: trimmed, source: source))
+        // Prepend "kg:" to message when MCP is connected
+        let messageText = mcpConnected ? "kg: \(trimmed)" : trimmed
+
+        messages.append(ChatMessage(role: .user, content: messageText, source: source))
         isLoading = true
         errorMessage = nil
 
