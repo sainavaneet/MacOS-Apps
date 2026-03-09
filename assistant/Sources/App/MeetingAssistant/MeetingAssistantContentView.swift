@@ -25,6 +25,12 @@ struct MeetingAssistantContentView: View {
         }
         .onChange(of: microphoneManager.selectedMicrophoneID) { _, newValue in
             speechEngine.reconnect(microphoneID: newValue)
+            UserDefaults.standard.set(newValue, forKey: "default_microphone_id")
+        }
+        .task {
+            if chatManager.autoConnectMCP && !chatManager.mcpConnected {
+                await chatManager.connectMCP()
+            }
         }
         .onChange(of: speechEngine.transcript) { _, newValue in
             chatManager.checkForQuestions(transcript: newValue)
@@ -231,8 +237,8 @@ private struct ChatView: View {
                 }
             }
 
-            // Compact transcript (only when recording or has partial)
-            if speechEngine.isListening || !speechEngine.partialTranscript.isEmpty {
+            // Compact transcript (when recording, has partial, or has pending manual transcript)
+            if speechEngine.isListening || !speechEngine.partialTranscript.isEmpty || (!chatManager.autoAnswer && hasPendingTranscript) {
                 compactTranscript
             }
 
@@ -333,8 +339,11 @@ private struct ChatView: View {
                         .font(.system(size: 12))
                 }
                 .help("Settings")
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) {
-                    settingsPopover
+                .sheet(isPresented: $showSettings) {
+                    SettingsSheet()
+                        .environmentObject(chatManager)
+                        .environmentObject(microphoneManager)
+                        .environmentObject(speechEngine)
                 }
 
                 // Clear chat
@@ -364,13 +373,19 @@ private struct ChatView: View {
             }
             .frame(width: 36, height: 18)
 
-            // Live text
+            // Live text / pending transcript info
             if !speechEngine.partialTranscript.isEmpty {
                 Text(speechEngine.partialTranscript)
                     .font(.system(size: 11))
                     .foregroundStyle(.blue)
                     .italic()
                     .lineLimit(2)
+            } else if !chatManager.autoAnswer && hasPendingTranscript {
+                let pendingText = String(speechEngine.transcript.dropFirst(chatManager.lastProcessedTranscriptLength))
+                let lineCount = pendingText.components(separatedBy: "\n").filter { !$0.isEmpty }.count
+                Text("\(lineCount) line\(lineCount == 1 ? "" : "s") queued")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.purple)
             } else if let lastLine = recentTranscriptLines.last {
                 Text(stripTimestamp(lastLine))
                     .font(.system(size: 11))
@@ -432,18 +447,18 @@ private struct ChatView: View {
                         .fill(Color(.controlBackgroundColor).opacity(0.5))
                 )
 
-            // Send button
+            // Send button — sends typed text, or pending transcript if input is empty
             Button(action: sendMessage) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(
-                        inputText.trimmingCharacters(in: .whitespaces).isEmpty
-                            ? AnyShapeStyle(Color(.separatorColor))
-                            : AnyShapeStyle(LinearGradient(colors: [.blue, .purple], startPoint: .top, endPoint: .bottom))
+                        canSend
+                            ? AnyShapeStyle(LinearGradient(colors: [.blue, .purple], startPoint: .top, endPoint: .bottom))
+                            : AnyShapeStyle(Color(.separatorColor))
                     )
             }
             .buttonStyle(.plain)
-            .disabled(inputText.trimmingCharacters(in: .whitespaces).isEmpty || chatManager.isLoading)
+            .disabled(!canSend || chatManager.isLoading)
             .padding(.bottom, 1)
         }
         .padding(.horizontal, 14)
@@ -452,60 +467,7 @@ private struct ChatView: View {
         .background(.ultraThinMaterial)
     }
 
-    // MARK: - Settings Popover
-
-    private var settingsPopover: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Settings")
-                .font(.system(size: 13, weight: .semibold))
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Anthropic API Key")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                SecureField("sk-ant-...", text: $chatManager.apiKey)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11, design: .monospaced))
-                    .frame(width: 260)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Microphone")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-
-                if microphoneManager.hasPermission {
-                    Picker("", selection: $microphoneManager.selectedMicrophoneID) {
-                        ForEach(microphoneManager.microphones) { mic in
-                            Text(mic.name).tag(mic.id)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 260)
-                } else {
-                    Button("Allow Microphone Access") {
-                        microphoneManager.requestPermissionAndRefresh()
-                    }
-                    .font(.system(size: 11))
-                }
-            }
-
-            if let error = chatManager.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.orange)
-                    .lineLimit(3)
-            }
-
-            if let error = speechEngine.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-        }
-        .padding(16)
-    }
+    // Settings popover removed — now using SettingsSheet
 
     // MARK: - Empty State
 
@@ -549,6 +511,16 @@ private struct ChatView: View {
         return line
     }
 
+    private var hasPendingTranscript: Bool {
+        speechEngine.transcript.count > chatManager.lastProcessedTranscriptLength
+    }
+
+    private func sendPendingTranscript() {
+        Task {
+            await chatManager.sendPendingTranscript(transcript: speechEngine.transcript)
+        }
+    }
+
     private func copyTranscript() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(speechEngine.transcript, forType: .string)
@@ -568,11 +540,21 @@ private struct ChatView: View {
         ChatManager.availableModels.first(where: { $0.id == chatManager.model })?.name ?? "Haiku 4.5"
     }
 
+    private var canSend: Bool {
+        !inputText.trimmingCharacters(in: .whitespaces).isEmpty || (!chatManager.autoAnswer && hasPendingTranscript)
+    }
+
     private func sendMessage() {
-        let text = inputText
-        inputText = ""
-        Task {
-            await chatManager.send(text, transcript: speechEngine.transcript)
+        let hasTypedText = !inputText.trimmingCharacters(in: .whitespaces).isEmpty
+
+        if hasTypedText {
+            let text = inputText
+            inputText = ""
+            Task {
+                await chatManager.send(text, transcript: speechEngine.transcript)
+            }
+        } else if !chatManager.autoAnswer && hasPendingTranscript {
+            sendPendingTranscript()
         }
     }
 }
@@ -1077,6 +1059,203 @@ private struct MarkdownText: View {
                 .font(.system(size: fontSize, weight: fontWeight))
                 .lineSpacing(4)
                 .textSelection(.enabled)
+        }
+    }
+}
+
+// MARK: - Settings Sheet
+
+private struct SettingsSheet: View {
+    @EnvironmentObject private var chatManager: ChatManager
+    @EnvironmentObject private var microphoneManager: MicrophoneManager
+    @EnvironmentObject private var speechEngine: SpeechEngine
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Settings")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Button("Done") { dismiss() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+            .padding(16)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+
+                    // MARK: API Configuration
+                    settingsSection("API Configuration", icon: "key.fill", color: .orange) {
+                        settingsRow("Anthropic API Key") {
+                            SecureField("sk-ant-...", text: $chatManager.apiKey)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+
+                        settingsRow("Claude Model") {
+                            Picker("", selection: $chatManager.model) {
+                                ForEach(ChatManager.availableModels, id: \.id) { model in
+                                    Text(model.name).tag(model.id)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                    }
+
+                    // MARK: MCP Configuration
+                    settingsSection("MCP Server", icon: "bolt.fill", color: .green) {
+                        settingsRow("Server Path") {
+                            TextField("Path to MCP server", text: $chatManager.mcpServerPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+
+                        settingsRow("Python Path") {
+                            TextField("Path to Python", text: $chatManager.mcpPythonPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+
+                        Toggle(isOn: $chatManager.autoConnectMCP) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Auto-connect MCP")
+                                    .font(.system(size: 12, weight: .medium))
+                                Text("Automatically connect to MCP server when window opens")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(chatManager.mcpConnected ? .green : .red.opacity(0.5))
+                                .frame(width: 8, height: 8)
+                            Text(chatManager.mcpConnected ? "Connected" : "Disconnected")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button(chatManager.mcpConnected ? "Disconnect" : "Connect Now") {
+                                Task {
+                                    if chatManager.mcpConnected {
+                                        chatManager.disconnectMCP()
+                                    } else {
+                                        await chatManager.connectMCP()
+                                    }
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+
+                    // MARK: Microphone
+                    settingsSection("Microphone", icon: "mic.fill", color: .blue) {
+                        if microphoneManager.hasPermission {
+                            settingsRow("Default Microphone") {
+                                Picker("", selection: $microphoneManager.selectedMicrophoneID) {
+                                    ForEach(microphoneManager.microphones) { mic in
+                                        Text(mic.name).tag(mic.id)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                        } else {
+                            HStack {
+                                Text("Microphone access required")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Allow Access") {
+                                    microphoneManager.requestPermissionAndRefresh()
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+
+                    // MARK: Behavior
+                    settingsSection("Behavior", icon: "sparkles", color: .purple) {
+                        Toggle(isOn: $chatManager.autoAnswer) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Auto-answer")
+                                    .font(.system(size: 12, weight: .medium))
+                                Text("Automatically send transcribed speech to Claude for answers")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
+
+                    // MARK: Errors
+                    if chatManager.errorMessage != nil || speechEngine.errorMessage != nil {
+                        settingsSection("Status", icon: "exclamationmark.triangle.fill", color: .orange) {
+                            if let error = chatManager.errorMessage {
+                                Label(error, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(3)
+                            }
+                            if let error = speechEngine.errorMessage {
+                                Label(error, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.red)
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
+                }
+                .padding(16)
+            }
+        }
+        .frame(width: 420, height: 520)
+    }
+
+    // MARK: - Helpers
+
+    @ViewBuilder
+    private func settingsSection<Content: View>(
+        _ title: String,
+        icon: String,
+        color: Color,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(color)
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                content()
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color(.controlBackgroundColor))
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func settingsRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.tertiary)
+            content()
         }
     }
 }

@@ -14,6 +14,8 @@ final class MicrophoneManager: ObservableObject {
     @Published private(set) var hasPermission = false
 
     init() {
+        let saved = UserDefaults.standard.string(forKey: "default_microphone_id") ?? ""
+        _selectedMicrophoneID = Published(initialValue: saved)
         refreshAuthorizationAndDevices()
     }
 

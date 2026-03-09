@@ -7,7 +7,8 @@ final class ChatManager: ObservableObject {
     @Published var isLoading = false
     @Published var errorMessage: String?
     @Published var mcpConnected = false
-    @Published var autoAnswer = true
+    @AppStorage("auto_answer_enabled") var autoAnswer = true
+    @AppStorage("auto_connect_mcp") var autoConnectMCP = false
 
     @AppStorage("anthropic_api_key") var apiKey: String = ""
     @AppStorage("mcp_server_path") var mcpServerPath: String =
@@ -199,6 +200,38 @@ final class ChatManager: ObservableObject {
         Task {
             await send(combined, transcript: transcript, source: .speech)
         }
+    }
+
+    /// Manually send accumulated unsent transcript text to Claude.
+    func sendPendingTranscript(transcript: String) async {
+        guard !isLoading, !apiKey.isEmpty else { return }
+
+        let newText = String(transcript.dropFirst(lastProcessedTranscriptLength))
+        lastProcessedTranscriptLength = transcript.count
+
+        guard !newText.isEmpty else { return }
+
+        let lines = newText.components(separatedBy: "\n")
+        var speechTexts: [String] = []
+
+        for line in lines {
+            let text: String
+            if let bracket = line.range(of: "] "), line.hasPrefix("[") {
+                text = String(line[bracket.upperBound...])
+            } else {
+                text = line
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                speechTexts.append(trimmed)
+            }
+        }
+
+        guard !speechTexts.isEmpty else { return }
+
+        let combined = speechTexts.joined(separator: " ")
+        print("[ChatManager] Manual send transcript: \(combined)")
+        await send(combined, transcript: transcript, source: .speech)
     }
 
     func clearChat() {

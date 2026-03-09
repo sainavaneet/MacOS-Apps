@@ -1,0 +1,6 @@
+# Large model files
+*.bin
+assistant/models/
+
+# macOS
+.DS_Store
