@@ -1,5 +1,13 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
+
+// Make UUID transferable for drag and drop
+extension UUID: @retroactive Transferable {
+    public static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .utf8PlainText)
+    }
+}
 
 struct MeetingAssistantContentView: View {
     @EnvironmentObject private var microphoneManager: MicrophoneManager
@@ -174,6 +182,12 @@ private struct SidebarView: View {
                                     sessionRowWithContextMenu(summary: summary)
                                 }
                             }
+                            .dropDestination(for: UUID.self) { droppedItems, _ in
+                                for sessionId in droppedItems {
+                                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
+                                }
+                                return true
+                            }
                         }
 
                         // Folders
@@ -200,6 +214,13 @@ private struct SidebarView: View {
                                         }
                                     }
                                 }
+                            }
+                            .dropDestination(for: UUID.self) { droppedItems, _ in
+                                for sessionId in droppedItems {
+                                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
+                                    chatManager.folderManager.addSessionToFolder(sessionId: sessionId, folderId: folder.id)
+                                }
+                                return true
                             }
                         }
 
@@ -272,6 +293,7 @@ private struct SidebarView: View {
                 renamingSessionID = nil
             }
         )
+        .draggable(summary.id)
         .contextMenu {
             Section("Move to Folder") {
                 ForEach(chatManager.folderManager.folders) { folder in
