@@ -34,6 +34,9 @@ final class ChatManager: ObservableObject {
     private(set) var lastProcessedTranscriptLength = 0
     @AppStorage("claude_model") var model: String = "claude-haiku-4-5-20251001"
 
+    // Folder management
+    @Published var folderManager = FolderManager()
+
     // MARK: - Send Message
 
     /// Send a user message to Claude, with transcript context and MCP tools.

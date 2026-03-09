@@ -104,12 +104,16 @@ struct MeetingAssistantContentView: View {
 
 private struct SidebarView: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @EnvironmentObject private var chatManager: ChatManager
 
     let onNewChat: () -> Void
     let onLoadSession: (UUID) -> Void
 
     @State private var renamingSessionID: UUID?
     @State private var renameText: String = ""
+    @State private var showCreateFolder = false
+    @State private var newFolderName = ""
+    @State private var expandedFolders: Set<UUID> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -143,7 +147,7 @@ private struct SidebarView: View {
 
             Divider()
 
-            // Sessions list
+            // Sessions list with folders
             if sessionManager.sessions.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
@@ -158,31 +162,170 @@ private struct SidebarView: View {
                 .frame(maxWidth: .infinity)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(sessionManager.sessions) { summary in
-                            SessionRow(
-                                summary: summary,
-                                isActive: summary.id == sessionManager.currentSessionID,
-                                isRenaming: renamingSessionID == summary.id,
-                                renameText: $renameText,
-                                onSelect: { onLoadSession(summary.id) },
-                                onDelete: { sessionManager.delete(id: summary.id) },
-                                onRenameStart: {
-                                    renamingSessionID = summary.id
-                                    renameText = summary.title
-                                },
-                                onRenameCommit: {
-                                    sessionManager.rename(id: summary.id, to: renameText)
-                                    renamingSessionID = nil
-                                }
-                            )
+                    LazyVStack(spacing: 2, pinnedViews: [.sectionHeaders]) {
+                        // New Chats section
+                        let newChats = sessionManager.sessions.filter { session in
+                            chatManager.folderManager.getFolder(for: session.id) == nil
                         }
+
+                        if !newChats.isEmpty {
+                            Section(header: folderHeader(name: "New Chats", isExpanded: true)) {
+                                ForEach(newChats) { summary in
+                                    sessionRowWithContextMenu(summary: summary)
+                                }
+                            }
+                        }
+
+                        // Folders
+                        ForEach(chatManager.folderManager.folders) { folder in
+                            let folderChats = sessionManager.sessions.filter { folder.sessionIds.contains($0.id) }
+                            let isExpanded = expandedFolders.contains(folder.id)
+
+                            if !folderChats.isEmpty {
+                                Section(header: folderHeader(name: folder.name, isExpanded: isExpanded, onToggle: {
+                                    if expandedFolders.contains(folder.id) {
+                                        expandedFolders.remove(folder.id)
+                                    } else {
+                                        expandedFolders.insert(folder.id)
+                                    }
+                                }, folder: folder)) {
+                                    if isExpanded {
+                                        ForEach(folderChats) { summary in
+                                            sessionRowWithContextMenu(summary: summary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Create Folder button
+                        Button(action: { showCreateFolder = true }) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "plus.circle")
+                                    .font(.system(size: 12))
+                                Text("Create Folder")
+                                    .font(.system(size: 12))
+                                Spacer()
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .foregroundStyle(.blue)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(8)
                     }
-                    .padding(8)
+                    .padding(0)
                 }
             }
         }
         .background(Color(.windowBackgroundColor))
+        .sheet(isPresented: $showCreateFolder) {
+            VStack(spacing: 12) {
+                Text("Create New Folder")
+                    .font(.system(size: 14, weight: .semibold))
+
+                TextField("Folder name", text: $newFolderName)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Button("Cancel") { showCreateFolder = false }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Create") {
+                        if !newFolderName.trimmingCharacters(in: .whitespaces).isEmpty {
+                            chatManager.folderManager.createFolder(name: newFolderName)
+                            newFolderName = ""
+                            showCreateFolder = false
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(16)
+            .frame(minWidth: 300)
+        }
+    }
+
+    private func sessionRowWithContextMenu(summary: ChatSessionSummary) -> some View {
+        SessionRow(
+            summary: summary,
+            isActive: summary.id == sessionManager.currentSessionID,
+            isRenaming: renamingSessionID == summary.id,
+            renameText: $renameText,
+            onSelect: { onLoadSession(summary.id) },
+            onDelete: { sessionManager.delete(id: summary.id) },
+            onRenameStart: {
+                renamingSessionID = summary.id
+                renameText = summary.title
+            },
+            onRenameCommit: {
+                sessionManager.rename(id: summary.id, to: renameText)
+                renamingSessionID = nil
+            }
+        )
+        .contextMenu {
+            Section("Move to Folder") {
+                ForEach(chatManager.folderManager.folders) { folder in
+                    Button(action: {
+                        chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
+                        chatManager.folderManager.addSessionToFolder(sessionId: summary.id, folderId: folder.id)
+                    }) {
+                        Label(folder.name, systemImage: "folder.fill")
+                    }
+                }
+
+                if !chatManager.folderManager.folders.isEmpty {
+                    Divider()
+                }
+
+                Button(action: {
+                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
+                }) {
+                    Label("New Chats", systemImage: "arrow.left")
+                }
+            }
+        }
+    }
+
+    private func folderHeader(name: String, isExpanded: Bool, onToggle: (() -> Void)? = nil, folder: ChatFolder? = nil) -> some View {
+        HStack(spacing: 8) {
+            if let onToggle = onToggle {
+                Button(action: onToggle) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Image(systemName: "folder.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+
+            Text(name)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            if let folder = folder {
+                Menu {
+                    Button("Delete", role: .destructive) {
+                        chatManager.folderManager.deleteFolder(id: folder.id)
+                        expandedFolders.remove(folder.id)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .menuStyle(.borderlessButton)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color(.controlBackgroundColor).opacity(0.5))
     }
 }
 
