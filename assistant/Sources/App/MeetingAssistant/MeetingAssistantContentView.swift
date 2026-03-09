@@ -270,33 +270,37 @@ private struct SidebarView: View {
                 .foregroundStyle(.secondary)
 
             Spacer()
-
-            // Paste button for New Chats section
-            if clipboardSessionId != nil && clipboardMode != .none {
-                Menu {
-                    Button(action: {
-                        if let sessionId = clipboardSessionId {
-                            if clipboardMode == .move {
-                                chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
-                            }
-                            clipboardSessionId = nil
-                            clipboardMode = .none
-                        }
-                    }) {
-                        Label("Paste", systemImage: "clipboard")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .menuStyle(.borderlessButton)
-            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color(.controlBackgroundColor).opacity(0.5))
+        .contentShape(Rectangle())
+        .contextMenu {
+            // Paste option
+            if clipboardSessionId != nil && clipboardMode != .none {
+                Button(action: {
+                    if let sessionId = clipboardSessionId {
+                        if clipboardMode == .move {
+                            chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
+                        }
+                        clipboardSessionId = nil
+                        clipboardMode = .none
+                    }
+                }) {
+                    Label("Paste Here", systemImage: "clipboard")
+                }
+
+                Divider()
+            }
+
+            Button(action: onNewChat) {
+                Label("New Chat", systemImage: "square.and.pencil")
+            }
+
+            Button(action: { showCreateFolder = true }) {
+                Label("New Folder", systemImage: "folder.badge.plus")
+            }
+        }
     }
 
     private func sessionRowWithContextMenu(summary: ChatSessionSummary) -> some View {
@@ -306,7 +310,10 @@ private struct SidebarView: View {
             isRenaming: renamingSessionID == summary.id,
             renameText: $renameText,
             onSelect: { onLoadSession(summary.id) },
-            onDelete: { sessionManager.delete(id: summary.id) },
+            onDelete: {
+                chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
+                sessionManager.delete(id: summary.id)
+            },
             onRenameStart: {
                 renamingSessionID = summary.id
                 renameText = summary.title
@@ -314,23 +321,24 @@ private struct SidebarView: View {
             onRenameCommit: {
                 sessionManager.rename(id: summary.id, to: renameText)
                 renamingSessionID = nil
-            }
-        )
-        .contextMenu {
-            Button(action: {
+            },
+            folders: chatManager.folderManager.folders,
+            onCopy: {
                 clipboardSessionId = summary.id
                 clipboardMode = .copy
-            }) {
-                Label("Copy", systemImage: "doc.on.doc")
-            }
-
-            Button(action: {
+            },
+            onMove: {
                 clipboardSessionId = summary.id
                 clipboardMode = .move
-            }) {
-                Label("Move", systemImage: "arrow.right.doc.on.clipboard")
+            },
+            onMoveToFolder: { folderId in
+                chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
+                chatManager.folderManager.addSessionToFolder(sessionId: summary.id, folderId: folderId)
+            },
+            onMoveToNewChats: {
+                chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
             }
-        }
+        )
     }
 
     private func folderHeader(name: String, isExpanded: Bool, onToggle: (() -> Void)? = nil, folder: ChatFolder? = nil) -> some View {
@@ -353,43 +361,41 @@ private struct SidebarView: View {
                 .foregroundStyle(.secondary)
 
             Spacer()
-
-            if let folder = folder {
-                Menu {
-                    // Paste option
-                    if clipboardSessionId != nil && clipboardMode != .none {
-                        Button(action: {
-                            if let sessionId = clipboardSessionId {
-                                if clipboardMode == .move {
-                                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
-                                }
-                                chatManager.folderManager.addSessionToFolder(sessionId: sessionId, folderId: folder.id)
-                                clipboardSessionId = nil
-                                clipboardMode = .none
-                            }
-                        }) {
-                            Label("Paste", systemImage: "clipboard")
-                        }
-
-                        Divider()
-                    }
-
-                    Button("Delete", role: .destructive) {
-                        chatManager.folderManager.deleteFolder(id: folder.id)
-                        expandedFolders.remove(folder.id)
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .menuStyle(.borderlessButton)
-            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color(.controlBackgroundColor).opacity(0.5))
+        .contentShape(Rectangle())
+        .contextMenu {
+            if let folder = folder {
+                // Paste option
+                if clipboardSessionId != nil && clipboardMode != .none {
+                    Button(action: {
+                        if let sessionId = clipboardSessionId {
+                            if clipboardMode == .move {
+                                chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
+                            }
+                            chatManager.folderManager.addSessionToFolder(sessionId: sessionId, folderId: folder.id)
+                            clipboardSessionId = nil
+                            clipboardMode = .none
+                        }
+                    }) {
+                        Label("Paste Here", systemImage: "clipboard")
+                    }
+
+                    Divider()
+                }
+
+                Button(action: { showCreateFolder = true }) {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                }
+
+                Button("Delete Folder", role: .destructive) {
+                    chatManager.folderManager.deleteFolder(id: folder.id)
+                    expandedFolders.remove(folder.id)
+                }
+            }
+        }
     }
 }
 
@@ -708,31 +714,18 @@ private struct ChatView: View {
             .help(speechEngine.isListening ? "Stop" : "Record")
             .padding(.bottom, 1)
 
-            TextField("Ask a question...", text: $inputText, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .lineLimit(1...8)
-                .focused($inputFocused)
-                .onKeyPress { press in
-                    if press.key == .return {
-                        // Check if Shift is pressed
-                        if press.modifiers.contains(.shift) {
-                            // Shift+Enter: insert newline (let TextField handle it)
-                            return .ignored
-                        } else {
-                            // Enter alone: send message
-                            sendMessage()
-                            return .handled
-                        }
-                    }
-                    return .ignored
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(.controlBackgroundColor).opacity(0.5))
-                )
+            MultiLineInput(
+                text: $inputText,
+                isFocused: $inputFocused,
+                onEnter: { sendMessage() }
+            )
+            .frame(minHeight: 34, maxHeight: 160)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(.controlBackgroundColor).opacity(0.5))
+            )
 
             // Send button — sends typed text, or pending transcript if input is empty
             Button(action: sendMessage) {
@@ -1076,6 +1069,11 @@ private struct SessionRow: View {
     let onDelete: () -> Void
     let onRenameStart: () -> Void
     let onRenameCommit: () -> Void
+    var folders: [ChatFolder] = []
+    var onCopy: (() -> Void)?
+    var onMove: (() -> Void)?
+    var onMoveToFolder: ((UUID) -> Void)?
+    var onMoveToNewChats: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1118,9 +1116,48 @@ private struct SessionRow: View {
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
         .contextMenu {
-            Button("Rename") { onRenameStart() }
+            Button(action: { onRenameStart() }) {
+                Label("Rename", systemImage: "pencil")
+            }
+
             Divider()
-            Button("Delete", role: .destructive) { onDelete() }
+
+            if let onCopy = onCopy {
+                Button(action: onCopy) {
+                    Label("Copy to Clipboard", systemImage: "doc.on.doc")
+                }
+            }
+
+            if let onMove = onMove {
+                Button(action: onMove) {
+                    Label("Cut to Clipboard", systemImage: "scissors")
+                }
+            }
+
+            // Move to folder submenu
+            if !folders.isEmpty {
+                Divider()
+
+                Menu("Move to Folder") {
+                    ForEach(folders) { folder in
+                        Button(action: { onMoveToFolder?(folder.id) }) {
+                            Label(folder.name, systemImage: "folder.fill")
+                        }
+                    }
+
+                    Divider()
+
+                    Button(action: { onMoveToNewChats?() }) {
+                        Label("New Chats", systemImage: "tray")
+                    }
+                }
+            }
+
+            Divider()
+
+            Button(role: .destructive, action: { onDelete() }) {
+                Label("Delete", systemImage: "trash")
+            }
         }
     }
 
@@ -1606,5 +1643,119 @@ private struct SettingsSheet: View {
                 .foregroundStyle(.tertiary)
             content()
         }
+    }
+}
+
+// MARK: - Multi-Line Text Input (NSTextView wrapper)
+
+private struct MultiLineInput: NSViewRepresentable {
+    @Binding var text: String
+    var isFocused: FocusState<Bool>.Binding
+    var onEnter: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+
+        let textView = InputTextView()
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.font = NSFont.systemFont(ofSize: 13)
+        textView.textColor = NSColor.labelColor
+        textView.drawsBackground = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainerInset = NSSize(width: 0, height: 4)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.delegate = context.coordinator
+        textView.onEnter = onEnter
+
+        // Placeholder
+        textView.placeholderString = "Ask a question..."
+
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? InputTextView else { return }
+        if textView.string != text {
+            textView.string = text
+        }
+        textView.onEnter = onEnter
+    }
+
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: MultiLineInput
+
+        init(_ parent: MultiLineInput) {
+            self.parent = parent
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string
+        }
+    }
+}
+
+// Custom NSTextView that handles Enter vs Shift+Enter
+private class InputTextView: NSTextView {
+    var onEnter: (() -> Void)?
+    var placeholderString: String = "" {
+        didSet { needsDisplay = true }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let isReturn = event.keyCode == 36
+        let shiftPressed = event.modifierFlags.contains(.shift)
+
+        if isReturn && !shiftPressed {
+            // Enter alone: send message
+            onEnter?()
+        } else if isReturn && shiftPressed {
+            // Shift+Enter: insert newline
+            insertNewline(nil)
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        // Draw placeholder when empty
+        if string.isEmpty && !placeholderString.isEmpty {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.placeholderTextColor,
+                .font: NSFont.systemFont(ofSize: 13)
+            ]
+            let rect = NSRect(x: textContainerInset.width,
+                              y: textContainerInset.height,
+                              width: bounds.width - textContainerInset.width * 2,
+                              height: bounds.height - textContainerInset.height * 2)
+            placeholderString.draw(in: rect, withAttributes: attrs)
+        }
+    }
+
+    override var intrinsicContentSize: NSSize {
+        guard let container = textContainer, let manager = layoutManager else {
+            return super.intrinsicContentSize
+        }
+        manager.ensureLayout(for: container)
+        let rect = manager.usedRect(for: container)
+        let height = min(max(rect.height + textContainerInset.height * 2, 26), 150)
+        return NSSize(width: NSView.noIntrinsicMetric, height: height)
     }
 }
