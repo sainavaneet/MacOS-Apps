@@ -1,13 +1,5 @@
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
-
-// Make UUID transferable for drag and drop
-extension UUID: @retroactive Transferable {
-    public static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .utf8PlainText)
-    }
-}
 
 struct MeetingAssistantContentView: View {
     @EnvironmentObject private var microphoneManager: MicrophoneManager
@@ -123,6 +115,16 @@ private struct SidebarView: View {
     @State private var newFolderName = ""
     @State private var expandedFolders: Set<UUID> = []
 
+    // Clipboard state for copy/move operations
+    @State private var clipboardSessionId: UUID?
+    @State private var clipboardMode: ClipboardMode = .none
+
+    enum ClipboardMode {
+        case none
+        case copy
+        case move
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -177,16 +179,10 @@ private struct SidebarView: View {
                         }
 
                         if !newChats.isEmpty {
-                            Section(header: folderHeader(name: "New Chats", isExpanded: true)) {
+                            Section(header: newChatsHeader()) {
                                 ForEach(newChats) { summary in
                                     sessionRowWithContextMenu(summary: summary)
                                 }
-                            }
-                            .dropDestination(for: UUID.self) { droppedItems, _ in
-                                for sessionId in droppedItems {
-                                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
-                                }
-                                return true
                             }
                         }
 
@@ -215,36 +211,23 @@ private struct SidebarView: View {
                                     }
                                 }
                             }
-                            .dropDestination(for: UUID.self) { droppedItems, _ in
-                                for sessionId in droppedItems {
-                                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
-                                    chatManager.folderManager.addSessionToFolder(sessionId: sessionId, folderId: folder.id)
-                                }
-                                return true
-                            }
                         }
 
-                        // Create Folder button
-                        Button(action: { showCreateFolder = true }) {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus.circle")
-                                    .font(.system(size: 12))
-                                Text("Create Folder")
-                                    .font(.system(size: 12))
-                                Spacer()
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                            .foregroundStyle(.blue)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(8)
                     }
                     .padding(0)
                 }
             }
         }
         .background(Color(.windowBackgroundColor))
+        .contextMenu {
+            Button(action: onNewChat) {
+                Label("New Chat", systemImage: "square.and.pencil")
+            }
+
+            Button(action: { showCreateFolder = true }) {
+                Label("Create Folder", systemImage: "folder.badge.plus")
+            }
+        }
         .sheet(isPresented: $showCreateFolder) {
             VStack(spacing: 12) {
                 Text("Create New Folder")
@@ -276,6 +259,46 @@ private struct SidebarView: View {
         }
     }
 
+    private func newChatsHeader() -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 11))
+                .foregroundStyle(.blue)
+
+            Text("New Chats")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            // Paste button for New Chats section
+            if clipboardSessionId != nil && clipboardMode != .none {
+                Menu {
+                    Button(action: {
+                        if let sessionId = clipboardSessionId {
+                            if clipboardMode == .move {
+                                chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
+                            }
+                            clipboardSessionId = nil
+                            clipboardMode = .none
+                        }
+                    }) {
+                        Label("Paste", systemImage: "clipboard")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .menuStyle(.borderlessButton)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color(.controlBackgroundColor).opacity(0.5))
+    }
+
     private func sessionRowWithContextMenu(summary: ChatSessionSummary) -> some View {
         SessionRow(
             summary: summary,
@@ -293,27 +316,19 @@ private struct SidebarView: View {
                 renamingSessionID = nil
             }
         )
-        .draggable(summary.id)
         .contextMenu {
-            Section("Move to Folder") {
-                ForEach(chatManager.folderManager.folders) { folder in
-                    Button(action: {
-                        chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
-                        chatManager.folderManager.addSessionToFolder(sessionId: summary.id, folderId: folder.id)
-                    }) {
-                        Label(folder.name, systemImage: "folder.fill")
-                    }
-                }
+            Button(action: {
+                clipboardSessionId = summary.id
+                clipboardMode = .copy
+            }) {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
 
-                if !chatManager.folderManager.folders.isEmpty {
-                    Divider()
-                }
-
-                Button(action: {
-                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: summary.id)
-                }) {
-                    Label("New Chats", systemImage: "arrow.left")
-                }
+            Button(action: {
+                clipboardSessionId = summary.id
+                clipboardMode = .move
+            }) {
+                Label("Move", systemImage: "arrow.right.doc.on.clipboard")
             }
         }
     }
@@ -341,6 +356,24 @@ private struct SidebarView: View {
 
             if let folder = folder {
                 Menu {
+                    // Paste option
+                    if clipboardSessionId != nil && clipboardMode != .none {
+                        Button(action: {
+                            if let sessionId = clipboardSessionId {
+                                if clipboardMode == .move {
+                                    chatManager.folderManager.removeSessionFromAllFolders(sessionId: sessionId)
+                                }
+                                chatManager.folderManager.addSessionToFolder(sessionId: sessionId, folderId: folder.id)
+                                clipboardSessionId = nil
+                                clipboardMode = .none
+                            }
+                        }) {
+                            Label("Paste", systemImage: "clipboard")
+                        }
+
+                        Divider()
+                    }
+
                     Button("Delete", role: .destructive) {
                         chatManager.folderManager.deleteFolder(id: folder.id)
                         expandedFolders.remove(folder.id)
