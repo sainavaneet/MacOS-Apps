@@ -713,8 +713,19 @@ private struct ChatView: View {
                 .font(.system(size: 13))
                 .lineLimit(1...8)
                 .focused($inputFocused)
-                .onSubmit {
-                    sendMessage()
+                .onKeyPress { press in
+                    if press.key == .return {
+                        // Check if Shift is pressed
+                        if press.modifiers.contains(.shift) {
+                            // Shift+Enter: insert newline (let TextField handle it)
+                            return .ignored
+                        } else {
+                            // Enter alone: send message
+                            sendMessage()
+                            return .handled
+                        }
+                    }
+                    return .ignored
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
