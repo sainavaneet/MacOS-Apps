@@ -181,15 +181,20 @@ private struct SidebarView: View {
                             let folderChats = sessionManager.sessions.filter { folder.sessionIds.contains($0.id) }
                             let isExpanded = expandedFolders.contains(folder.id)
 
-                            if !folderChats.isEmpty {
-                                Section(header: folderHeader(name: folder.name, isExpanded: isExpanded, onToggle: {
-                                    if expandedFolders.contains(folder.id) {
-                                        expandedFolders.remove(folder.id)
+                            Section(header: folderHeader(name: folder.name, isExpanded: isExpanded, onToggle: {
+                                if expandedFolders.contains(folder.id) {
+                                    expandedFolders.remove(folder.id)
+                                } else {
+                                    expandedFolders.insert(folder.id)
+                                }
+                            }, folder: folder)) {
+                                if isExpanded {
+                                    if folderChats.isEmpty {
+                                        Text("No chats yet")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.tertiary)
+                                            .padding(.vertical, 8)
                                     } else {
-                                        expandedFolders.insert(folder.id)
-                                    }
-                                }, folder: folder)) {
-                                    if isExpanded {
                                         ForEach(folderChats) { summary in
                                             sessionRowWithContextMenu(summary: summary)
                                         }
@@ -234,6 +239,10 @@ private struct SidebarView: View {
                     Button("Create") {
                         if !newFolderName.trimmingCharacters(in: .whitespaces).isEmpty {
                             chatManager.folderManager.createFolder(name: newFolderName)
+                            // Auto-expand the newly created folder
+                            if let newFolder = chatManager.folderManager.folders.last {
+                                expandedFolders.insert(newFolder.id)
+                            }
                             newFolderName = ""
                             showCreateFolder = false
                         }

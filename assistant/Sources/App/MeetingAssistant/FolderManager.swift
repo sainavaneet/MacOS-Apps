@@ -27,6 +27,8 @@ final class FolderManager: ObservableObject {
     func createFolder(name: String) {
         let folder = ChatFolder(name: name)
         folders.append(folder)
+        // Force a property change notification
+        objectWillChange.send()
         save()
     }
 
