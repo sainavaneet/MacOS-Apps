@@ -38,6 +38,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastSlack: Date?
 
     var runningProcess: Process?
+    var pendingQueue: [SyncKind] = []
+
+    // Auto-sync
+    let driveInterval: TimeInterval = 30 * 60   // 30 min
+    let slackInterval: TimeInterval = 10 * 60   // 10 min
+    var driveTimer: Timer?
+    var slackTimer: Timer?
+    var autoSyncEnabled: Bool = true
+    var autoSyncMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
@@ -46,6 +55,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         statusItem.menu = menu
         render()
+
+        // Run both syncs once on launch, then start the timers
+        enqueue(.drive)
+        enqueue(.slack)
+        startAutoSyncTimers()
     }
 
     func buildMenu() {
@@ -69,6 +83,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                 action: #selector(syncSlack), keyEquivalent: "s"))
         menu.addItem(NSMenuItem(title: "Sync Both",
                                 action: #selector(syncBoth), keyEquivalent: "b"))
+        menu.addItem(.separator())
+        autoSyncMenuItem = NSMenuItem(title: "Auto-sync: On (Drive 30m / Slack 10m)",
+                                       action: #selector(toggleAutoSync), keyEquivalent: "a")
+        menu.addItem(autoSyncMenuItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Open Logs",
                                 action: #selector(openLogs), keyEquivalent: "l"))
@@ -176,11 +194,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
-    @objc func syncDrive() { run(.drive) }
-    @objc func syncSlack() { run(.slack) }
+    @objc func syncDrive() { enqueue(.drive) }
+    @objc func syncSlack() { enqueue(.slack) }
 
     @objc func syncBoth() {
-        run(.drive) { [weak self] _ in self?.run(.slack) }
+        enqueue(.drive)
+        enqueue(.slack)
+    }
+
+    @objc func toggleAutoSync() {
+        autoSyncEnabled.toggle()
+        if autoSyncEnabled {
+            startAutoSyncTimers()
+            autoSyncMenuItem.title = "Auto-sync: On (Drive 30m / Slack 10m)"
+        } else {
+            driveTimer?.invalidate(); driveTimer = nil
+            slackTimer?.invalidate(); slackTimer = nil
+            autoSyncMenuItem.title = "Auto-sync: Off"
+        }
+    }
+
+    func startAutoSyncTimers() {
+        driveTimer?.invalidate()
+        slackTimer?.invalidate()
+        driveTimer = Timer.scheduledTimer(withTimeInterval: driveInterval, repeats: true) { [weak self] _ in
+            self?.enqueue(.drive)
+        }
+        slackTimer = Timer.scheduledTimer(withTimeInterval: slackInterval, repeats: true) { [weak self] _ in
+            self?.enqueue(.slack)
+        }
+    }
+
+    func enqueue(_ kind: SyncKind) {
+        // de-dup: don't queue the same kind twice
+        if pendingQueue.contains(kind) { return }
+        pendingQueue.append(kind)
+        drainQueue()
+    }
+
+    func drainQueue() {
+        guard runningProcess?.isRunning != true else { return }
+        guard !pendingQueue.isEmpty else { return }
+        let next = pendingQueue.removeFirst()
+        run(next) { [weak self] _ in self?.drainQueue() }
     }
 
     @objc func openLogs() {
