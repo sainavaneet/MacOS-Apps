@@ -35,6 +35,15 @@ struct MeetingAssistantContentView: View {
         .onChange(of: speechEngine.transcript) { _, newValue in
             chatManager.checkForQuestions(transcript: newValue)
         }
+        .onChange(of: chatManager.isLoading) { _, loading in
+            // Pause speech recognition while Claude is generating a response.
+            // The audio engine keeps running so system audio (BlackHole) is unaffected.
+            if loading {
+                speechEngine.pauseRecognition()
+            } else {
+                speechEngine.resumeRecognition()
+            }
+        }
         .onChange(of: chatManager.messages.count) { _, _ in
             saveCurrentSession()
         }

@@ -2,6 +2,7 @@ import AVFoundation
 import AudioToolbox
 import Speech
 import Foundation
+import os
 
 @MainActor
 final class SpeechEngine: ObservableObject {
@@ -13,6 +14,11 @@ final class SpeechEngine: ObservableObject {
     @Published private(set) var audioLevel: Float = 0
     @Published private(set) var elapsedTime: TimeInterval = 0
 
+    /// When true, audio buffers are NOT fed to the speech recognizer.
+    /// The audio engine keeps running so BlackHole/system audio is unaffected.
+    /// Set this when Claude is generating or the app is busy.
+    @Published var recognitionPaused: Bool = false
+
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -20,17 +26,28 @@ final class SpeechEngine: ObservableObject {
     private var audioEngine: AVAudioEngine?
     private var restartTimer: Timer?
     private var elapsedTimer: Timer?
+    private var audioLevelTimer: Timer?
     private var recordingStartDate: Date?
     private var currentMicrophoneID = ""
     private var shouldStayListening = false
     private var smoothedLevel: Float = 0
     private var pauseTimer: Timer?
 
-    // Noise gate: ignore buffers below this RMS level
-    private let noiseGateThreshold: Float = 0.008
-    // Track consecutive silent buffers to avoid sending noise
-    private var silentBufferCount: Int = 0
-    private let maxSilentBuffers: Int = 20 // ~0.9s of silence before we stop feeding
+    // Thread-safe storage — written by the real-time audio thread,
+    // read by the main thread via a polling timer.
+    // Using OSAllocatedUnfairLock for minimal overhead on the audio thread.
+    private let _latestRMS = OSAllocatedUnfairLock(initialState: Float(0))
+    private let _receivedFirstBuffer = OSAllocatedUnfairLock(initialState: false)
+
+    // Thread-safe reference to the current recognition request.
+    // The audio tap reads this to know where to send buffers.
+    // Swapped atomically during recognition restarts WITHOUT stopping the engine.
+    private let _activeRequest = OSAllocatedUnfairLock<SFSpeechAudioBufferRecognitionRequest?>(initialState: nil)
+
+    // Thread-safe pause flag read by the audio tap
+    private let _tapPaused = OSAllocatedUnfairLock(initialState: false)
+
+    // MARK: - Public API
 
     func toggleListening(microphoneID: String) {
         if isListening {
@@ -50,17 +67,41 @@ final class SpeechEngine: ObservableObject {
         }
     }
 
+    func loadTranscript(_ text: String) {
+        transcript = text
+    }
+
+    func clearTranscript() {
+        transcript = ""
+        partialTranscript = ""
+    }
+
+    /// Pause recognition (e.g. while Claude is generating).
+    /// Audio engine stays running — no disruption to system audio.
+    func pauseRecognition() {
+        recognitionPaused = true
+        _tapPaused.withLock { $0 = true }
+    }
+
+    /// Resume recognition after pause.
+    func resumeRecognition() {
+        recognitionPaused = false
+        _tapPaused.withLock { $0 = false }
+    }
+
+    // MARK: - Start / Stop
+
     private func startListening(microphoneID: String) {
         errorMessage = nil
         isReceivingAudio = false
         partialTranscript = ""
         currentMicrophoneID = microphoneID
         shouldStayListening = true
-        silentBufferCount = 0
+        let paused = recognitionPaused
+        _tapPaused.withLock { $0 = paused }
 
         print("[SpeechEngine] Starting — requesting microphone permission...")
 
-        // First request microphone access
         AVAudioApplication.requestRecordPermission { [weak self] granted in
             guard let self else { return }
             Task { @MainActor in
@@ -71,10 +112,9 @@ final class SpeechEngine: ObservableObject {
                     return
                 }
 
-                // Then request speech recognition authorization
                 SFSpeechRecognizer.requestAuthorization { authStatus in
                     Task { @MainActor in
-                        print("[SpeechEngine] Speech recognition auth: \(authStatus.rawValue) (0=notDetermined, 1=denied, 2=restricted, 3=authorized)")
+                        print("[SpeechEngine] Speech recognition auth: \(authStatus.rawValue)")
                         self.handleAuthorizationResponse(authStatus, microphoneID: microphoneID)
                     }
                 }
@@ -87,7 +127,7 @@ final class SpeechEngine: ObservableObject {
 
         switch authStatus {
         case .authorized:
-            setupAudioAndRecognition(microphoneID: microphoneID)
+            setupAudioEngine(microphoneID: microphoneID)
         case .denied:
             errorMessage = "Speech recognition permission denied. Enable in System Settings > Privacy & Security > Speech Recognition."
             shouldStayListening = false
@@ -103,10 +143,13 @@ final class SpeechEngine: ObservableObject {
         }
     }
 
-    private func setupAudioAndRecognition(microphoneID: String) {
+    /// Sets up the audio engine ONCE and installs the tap.
+    /// The engine stays running for the entire listening session.
+    /// Only the recognition request/task are restarted every ~55s.
+    private func setupAudioEngine(microphoneID: String) {
         guard shouldStayListening else { return }
 
-        // 1. Set up speech recognizer with explicit locale
+        // 1. Set up speech recognizer
         let locale = Locale(identifier: "en-US")
         speechRecognizer = SFSpeechRecognizer(locale: locale)
         guard let speechRecognizer else {
@@ -121,108 +164,124 @@ final class SpeechEngine: ObservableObject {
             return
         }
 
-        print("[SpeechEngine] Recognizer available. Supports on-device: \(speechRecognizer.supportsOnDeviceRecognition)")
+        print("[SpeechEngine] Recognizer available. On-device: \(speechRecognizer.supportsOnDeviceRecognition)")
 
-        // 2. Create recognition request with quality settings
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.addsPunctuation = true
-
-        // Prefer on-device recognition if available (lower latency, no network needed)
-        if speechRecognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-            print("[SpeechEngine] Using on-device recognition")
-        } else {
-            print("[SpeechEngine] On-device not available, using server-based recognition")
-        }
-
-        recognitionRequest = request
-
-        // 3. Start recognition task
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor in
-                self?.handleRecognitionResult(result, error: error)
-            }
-        }
-
-        // 4. Set up audio engine
+        // 2. Set up audio engine
         let engine = AVAudioEngine()
 
-        // Configure specific microphone if provided
+        // Configure specific microphone/device
         if !microphoneID.isEmpty {
             do {
                 try configureInputDevice(for: engine.inputNode, uniqueID: microphoneID)
-                print("[SpeechEngine] Configured microphone: \(microphoneID)")
+                print("[SpeechEngine] Configured device: \(microphoneID)")
             } catch {
-                print("[SpeechEngine] Could not configure specific mic (\(error.localizedDescription)), using system default")
+                print("[SpeechEngine] Could not configure device (\(error.localizedDescription)), using system default")
             }
         }
 
         let inputNode = engine.inputNode
-
-        // Use the node's output format — this is the format the tap will deliver
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         print("[SpeechEngine] Audio format: \(recordingFormat.sampleRate)Hz, \(recordingFormat.channelCount)ch")
 
         guard recordingFormat.sampleRate > 0 && recordingFormat.channelCount > 0 else {
             errorMessage = "No audio input available. Check that a microphone is connected."
             shouldStayListening = false
-            cleanup()
             return
         }
 
-        // 5. Install tap with larger buffer for smoother audio delivery
+        // 3. Install tap — does MINIMAL work to avoid audio glitches.
+        //
+        // CRITICAL: This callback runs on a real-time CoreAudio thread.
+        // Any blocking operation (GCD dispatch, Task creation, slow locks,
+        // memory allocation, I/O) can cause audio buffer underruns,
+        // producing clicking/popping/"keek" sounds.
+        //
+        // We ONLY do:
+        //   - Read an atomic pause flag
+        //   - Read an atomic request reference
+        //   - Append buffer to request (lock-free internally)
+        //   - Fast strided RMS calculation
+        //   - Write atomic RMS value
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
             guard let self else { return }
 
-            // Compute RMS audio level
-            let level = self.computeRMS(buffer: buffer)
-
-            // Noise gate: only send audio above threshold to recognizer
-            if level > self.noiseGateThreshold {
-                self.recognitionRequest?.append(buffer)
-                self.silentBufferCount = 0
-            } else {
-                self.silentBufferCount += 1
-                // Still send occasional silent buffers so recognizer stays alive
-                if self.silentBufferCount % 10 == 0 {
-                    self.recognitionRequest?.append(buffer)
-                }
+            // Check if paused (e.g., during Claude generation)
+            let paused = self._tapPaused.withLock { $0 }
+            if !paused {
+                // Feed audio to the current recognition request.
+                // This reference is swapped atomically during recognition restarts
+                // WITHOUT stopping/restarting the audio engine.
+                let request = self._activeRequest.withLock { $0 }
+                request?.append(buffer)
             }
 
-            Task { @MainActor in
-                if !self.isReceivingAudio {
-                    self.isReceivingAudio = true
-                    print("[SpeechEngine] Audio buffers flowing")
-                }
-                // Smooth audio level for visual display
-                let alpha: Float = level > self.smoothedLevel ? 0.4 : 0.15
-                self.smoothedLevel = alpha * level + (1 - alpha) * self.smoothedLevel
-                self.audioLevel = self.smoothedLevel
+            // Always compute level (even when paused) for the visual meter
+            let level = self.computeRMS(buffer: buffer)
+            self._latestRMS.withLock { $0 = level }
+
+            if !self._receivedFirstBuffer.withLock({ $0 }) {
+                self._receivedFirstBuffer.withLock { $0 = true }
             }
         }
 
-        // 6. Prepare and start engine
+        // 4. Start engine
         audioEngine = engine
+        _receivedFirstBuffer.withLock { $0 = false }
         engine.prepare()
+
         do {
             try engine.start()
-            isListening = true
-            startElapsedTimer()
-            print("[SpeechEngine] Audio engine started — listening")
-            startRestartTimer()
         } catch {
             errorMessage = "Failed to start audio engine: \(error.localizedDescription)"
             print("[SpeechEngine] ERROR starting engine: \(error)")
             shouldStayListening = false
             cleanup()
+            return
         }
+
+        isListening = true
+        startElapsedTimer()
+        startAudioLevelTimer()
+        print("[SpeechEngine] Audio engine started")
+
+        // 5. Start the first recognition session (engine stays running from here)
+        startNewRecognitionSession()
     }
 
+    /// Creates a new SFSpeechRecognition request + task.
+    /// Called on initial start and every ~55s (Apple's recognition time limit).
+    /// The audio engine and tap KEEP RUNNING — only the recognition session changes.
+    private func startNewRecognitionSession() {
+        guard shouldStayListening,
+              let speechRecognizer,
+              speechRecognizer.isAvailable else { return }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.addsPunctuation = true
+
+        if speechRecognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+
+        recognitionRequest = request
+
+        // Atomically publish the new request so the audio tap starts feeding it
+        _activeRequest.withLock { $0 = request }
+
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            Task { @MainActor in
+                self?.handleRecognitionResult(result, error: error)
+            }
+        }
+
+        startRestartTimer()
+        print("[SpeechEngine] Recognition session started")
+    }
+
+    // MARK: - Recognition Results
+
     private func handleRecognitionResult(_ result: SFSpeechRecognitionResult?, error: Error?) {
-        // Process the result FIRST, even if there's also an error.
-        // Apple's speech API can send a final result alongside an error (e.g., when the
-        // recognition session ends due to timeout or restart).
         if let result = result {
             if result.isFinal {
                 pauseTimer?.invalidate()
@@ -237,37 +296,26 @@ final class SpeechEngine: ObservableObject {
                 partialTranscript = ""
             } else {
                 let partial = result.bestTranscription.formattedString
-                // Only update partial if it has meaningful content
                 if !partial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     partialTranscript = partial
-                    // Pause detection: if partial text stays stable for 2s,
-                    // restart recognition to finalize the utterance.
                     resetPauseTimer()
                 }
             }
         }
 
-        // Handle errors after processing result
         if let error = error {
             let nsError = error as NSError
-            // Ignore common non-fatal errors:
-            // 216 = partial result error (normal)
-            // 209 = recognition task was cancelled (normal during restart)
-            // 301 = recognition request was cancelled (normal during restart)
-            // 1110 = no speech detected (expected when silent)
-            // 203 = retry (transient network issue)
             let ignoredCodes: Set<Int> = [216, 209, 301, 1110, 203]
             if !ignoredCodes.contains(nsError.code) {
                 print("[SpeechEngine] Recognition error [\(nsError.code)]: \(error.localizedDescription)")
-                // Only show persistent errors, not transient ones
-                if nsError.code != 4 { // 4 = operation couldn't be completed
+                if nsError.code != 4 {
                     errorMessage = error.localizedDescription
                 }
-            } else {
-                print("[SpeechEngine] Ignored recognition event [\(nsError.code)]")
             }
         }
     }
+
+    // MARK: - Timers & Restart
 
     private func resetPauseTimer() {
         pauseTimer?.invalidate()
@@ -276,8 +324,8 @@ final class SpeechEngine: ObservableObject {
             Task { @MainActor in
                 guard self.shouldStayListening, self.isListening,
                       !self.partialTranscript.isEmpty else { return }
-                print("[SpeechEngine] Pause detected — finalizing utterance")
-                self.restartRecognition()
+                print("[SpeechEngine] Pause detected — cycling recognition")
+                self.cycleRecognitionSession()
             }
         }
     }
@@ -287,56 +335,61 @@ final class SpeechEngine: ObservableObject {
         restartTimer = Timer.scheduledTimer(withTimeInterval: 55.0, repeats: false) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                self.restartRecognition()
+                print("[SpeechEngine] 55s limit — cycling recognition")
+                self.cycleRecognitionSession()
             }
         }
     }
 
-    private func restartRecognition() {
+    /// Cycle the recognition session WITHOUT stopping the audio engine.
+    /// This is the key improvement: the engine + tap keep running continuously,
+    /// so BlackHole/system audio is NEVER disrupted. Only the speech recognition
+    /// request and task are replaced.
+    private func cycleRecognitionSession() {
         guard shouldStayListening, isListening else { return }
 
-        let currentMicID = currentMicrophoneID
-
-        // Manually finalize any partial text BEFORE cancelling the task,
-        // because cancel() kills the task before the final result callback fires.
+        // 1. Finalize any pending partial text
         let pending = partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         if !pending.isEmpty {
             let time = timestampString()
             let entry = "[\(time)] \(pending)"
             transcript = transcript.isEmpty ? entry : "\(transcript)\n\(entry)"
-            print("[SpeechEngine] Finalized on restart: \(pending)")
+            print("[SpeechEngine] Finalized: \(pending)")
         }
         partialTranscript = ""
-        isReceivingAudio = false
-        silentBufferCount = 0
 
-        // Now tear down and restart
+        // 2. Detach the old request from the audio tap FIRST (atomic)
+        _activeRequest.withLock { $0 = nil }
+
+        // 3. End the old recognition session
+        restartTimer?.invalidate()
+        restartTimer = nil
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
-        stopAudioEngine()
 
-        // Small delay before restarting to let the system clean up
+        // 4. Small delay, then start a new recognition session.
+        // Audio engine keeps running the whole time!
         Task {
-            try? await Task.sleep(for: .milliseconds(150))
+            try? await Task.sleep(for: .milliseconds(100))
             guard self.shouldStayListening else { return }
-            self.setupAudioAndRecognition(microphoneID: currentMicID)
+            self.startNewRecognitionSession()
         }
     }
 
-    func loadTranscript(_ text: String) {
-        transcript = text
-    }
-
-    func clearTranscript() {
-        transcript = ""
-        partialTranscript = ""
-    }
+    // MARK: - Stop & Cleanup
 
     private func stopListening() {
         print("[SpeechEngine] Stopping")
         shouldStayListening = false
         partialTranscript = ""
+
+        // Detach request from tap first
+        _activeRequest.withLock { $0 = nil }
+
         recognitionRequest?.endAudio()
         stopAudioEngine()
         cleanup()
@@ -344,14 +397,13 @@ final class SpeechEngine: ObservableObject {
         isReceivingAudio = false
         audioLevel = 0
         smoothedLevel = 0
-        silentBufferCount = 0
         stopElapsedTimer()
     }
 
     private func stopAudioEngine() {
         if let engine = audioEngine {
-            engine.stop()
             engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
         }
         audioEngine = nil
     }
@@ -361,14 +413,42 @@ final class SpeechEngine: ObservableObject {
         restartTimer = nil
         pauseTimer?.invalidate()
         pauseTimer = nil
+        audioLevelTimer?.invalidate()
+        audioLevelTimer = nil
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
+        _activeRequest.withLock { $0 = nil }
         stopAudioEngine()
     }
 
-    // MARK: - Audio Level & Timer
+    // MARK: - Audio Level (polled from main thread)
 
+    /// Polls the latest RMS level at 10Hz. Keeps the audio tap
+    /// completely non-blocking — no GCD/Task dispatches on the audio thread.
+    private func startAudioLevelTimer() {
+        audioLevelTimer?.invalidate()
+        audioLevelTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                if !self.isReceivingAudio {
+                    let received = self._receivedFirstBuffer.withLock { $0 }
+                    if received {
+                        self.isReceivingAudio = true
+                        print("[SpeechEngine] Audio buffers flowing")
+                    }
+                }
+
+                let level = self._latestRMS.withLock { $0 }
+                let alpha: Float = level > self.smoothedLevel ? 0.4 : 0.15
+                self.smoothedLevel = alpha * level + (1 - alpha) * self.smoothedLevel
+                self.audioLevel = self.smoothedLevel
+            }
+        }
+    }
+
+    /// Fast RMS computation with stride-4 sampling.
+    /// Called on the real-time audio thread — must be fast.
     nonisolated private func computeRMS(buffer: AVAudioPCMBuffer) -> Float {
         guard let channelData = buffer.floatChannelData else { return 0 }
         let frames = Int(buffer.frameLength)
@@ -376,12 +456,14 @@ final class SpeechEngine: ObservableObject {
 
         var sum: Float = 0
         let samples = channelData[0]
-        for i in 0..<frames {
+        var i = 0
+        while i < frames {
             let sample = samples[i]
             sum += sample * sample
+            i += 4
         }
-        let rms = sqrtf(sum / Float(frames))
-        // Normalize: typical speech RMS is ~0.01–0.1, amplify for display
+        let samplesUsed = (frames + 3) / 4
+        let rms = sqrtf(sum / Float(samplesUsed))
         return min(rms * 5.0, 1.0)
     }
 
@@ -405,7 +487,7 @@ final class SpeechEngine: ObservableObject {
         recordingStartDate = nil
     }
 
-    // MARK: - Microphone Selection
+    // MARK: - Microphone / Device Selection
 
     private func configureInputDevice(for inputNode: AVAudioInputNode, uniqueID: String) throws {
         guard !uniqueID.isEmpty else { return }
