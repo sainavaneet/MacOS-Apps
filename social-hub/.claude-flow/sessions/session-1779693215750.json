@@ -1,0 +1,14 @@
+{
+  "id": "session-1779693215750",
+  "startedAt": "2026-05-25T07:13:35.750Z",
+  "cwd": "/Users/sainavaneet/PROJECTS/MacOS-Apps/social-hub",
+  "context": {},
+  "metrics": {
+    "edits": 34,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "endedAt": "2026-05-25T10:02:16.329Z",
+  "duration": 10120580
+}
